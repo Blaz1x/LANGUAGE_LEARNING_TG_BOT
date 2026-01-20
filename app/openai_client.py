@@ -1,31 +1,32 @@
+# app/openai_client.py
 import asyncio
+import logging
 import httpx
 from openai import AsyncOpenAI, APITimeoutError, APIConnectionError, RateLimitError
 
 from app.config import settings
-from app.logger import setup_logger
 
-logger = setup_logger()
+logger = logging.getLogger("mentor_bot")
 
-timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
+_timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
 
-http_client = httpx.AsyncClient(
+_http_client = httpx.AsyncClient(
     proxy=settings.OPENAI_PROXY or None,
-    timeout=timeout,
+    timeout=_timeout,
 )
 
 oa = AsyncOpenAI(
     api_key=settings.OPENAI_API_KEY,
-    http_client=http_client,
+    http_client=_http_client,
 )
 
-async def generate_text(system: str, user: str, model: str | None = None) -> str:
+async def generate_text(system: str, user: str) -> str:
     last_err = None
     for attempt in range(1, 4):
         try:
             logger.info(f"OpenAI request started (attempt {attempt}/3)")
             resp = await oa.responses.create(
-                model=model or settings.OPENAI_MODEL,
+                model=settings.OPENAI_MODEL,
                 instructions=system,
                 input=user,
             )

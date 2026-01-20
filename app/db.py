@@ -1,126 +1,163 @@
-import aiosqlite
-from app.logger import setup_logger
+# app/db.py
+from __future__ import annotations
 
-logger = setup_logger()
+import aiosqlite
+from typing import Any, Optional, Sequence
 
 class Database:
-    def __init__(self, path: str):
-        self.path = path
-        self.conn: aiosqlite.Connection | None = None
+    def __init__(self, db_path: str):
+        self.db_path = db_path
+        self.conn: Optional[aiosqlite.Connection] = None
 
-    async def connect(self):
-        self.conn = await aiosqlite.connect(self.path)
+    async def connect(self) -> None:
+        self.conn = await aiosqlite.connect(self.db_path)
         self.conn.row_factory = aiosqlite.Row
-        await self.conn.execute("PRAGMA foreign_keys = ON;")
-        logger.info("DB connected")
 
-    async def close(self):
+    async def close(self) -> None:
         if self.conn:
             await self.conn.close()
+            self.conn = None
 
-    async def execute(self, q: str, args: tuple = ()):
+    async def execute(self, sql: str, params: Sequence[Any] | None = None) -> None:
         assert self.conn
-        await self.conn.execute(q, args)
+        await self.conn.execute(sql, params or [])
         await self.conn.commit()
 
-    async def executescript(self, script: str):
+    async def executescript(self, script: str) -> None:
         assert self.conn
-        logger.info("Running DB migration script")
         await self.conn.executescript(script)
         await self.conn.commit()
 
-    async def fetchrow(self, q: str, args: tuple = ()):
+    async def fetchone(self, sql: str, params: Sequence[Any] | None = None) -> Optional[dict]:
         assert self.conn
-        cur = await self.conn.execute(q, args)
+        cur = await self.conn.execute(sql, params or [])
         row = await cur.fetchone()
         await cur.close()
-        return row
+        return dict(row) if row else None
 
-    async def fetchall(self, q: str, args: tuple = ()):
+    async def fetchall(self, sql: str, params: Sequence[Any] | None = None) -> list[dict]:
         assert self.conn
-        cur = await self.conn.execute(q, args)
+        cur = await self.conn.execute(sql, params or [])
         rows = await cur.fetchall()
         await cur.close()
-        return rows
+        return [dict(r) for r in rows]
 
-    async def upsert_user(self, tg_user_id: int, chat_id: int, tz: str):
-        q = """
-        INSERT INTO users (tg_user_id, tg_chat_id, timezone)
-        VALUES (?, ?, ?)
-        ON CONFLICT(tg_user_id) DO UPDATE SET
-          tg_chat_id=excluded.tg_chat_id,
-          timezone=excluded.timezone;
-        """
-        await self.execute(q, (tg_user_id, chat_id, tz))
-        user = await self.fetchrow("SELECT * FROM users WHERE tg_user_id=?", (tg_user_id,))
-        logger.info(f"User upserted: tg_user_id={tg_user_id}")
+    # ---------- Users ----------
+    async def upsert_user(self, tg_user_id: int, chat_id: int, timezone: str) -> dict:
+        # Keep compatible with your existing users table if it exists.
+        # If not exists, create minimal.
+        await self.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          tg_user_id INTEGER NOT NULL UNIQUE,
+          chat_id INTEGER NOT NULL,
+          timezone TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        """)
+        await self.execute(
+            """
+            INSERT INTO users (tg_user_id, chat_id, timezone)
+            VALUES (?, ?, ?)
+            ON CONFLICT(tg_user_id) DO UPDATE SET
+              chat_id=excluded.chat_id,
+              timezone=excluded.timezone
+            """,
+            [tg_user_id, chat_id, timezone],
+        )
+        user = await self.fetchone("SELECT * FROM users WHERE tg_user_id=?", [tg_user_id])
+        assert user
         return user
 
-    async def set_levels(self, tg_user_id: int, es_level: str | None = None, it_level: str | None = None):
-        user = await self.get_user_by_tg(tg_user_id)
-        if not user:
-            return None
+    async def get_user_by_tg(self, tg_user_id: int) -> Optional[dict]:
+        return await self.fetchone("SELECT * FROM users WHERE tg_user_id=?", [tg_user_id])
 
-        if es_level:
-            await self.execute("UPDATE users SET spanish_level=? WHERE tg_user_id=?", (es_level, tg_user_id))
-        if it_level:
-            await self.execute("UPDATE users SET italian_level=? WHERE tg_user_id=?", (it_level, tg_user_id))
+    async def get_all_users(self) -> list[dict]:
+        return await self.fetchall("SELECT * FROM users ORDER BY id")
 
-        return await self.get_user_by_tg(tg_user_id)
-
-    async def get_user_by_tg(self, tg_user_id: int):
-        return await self.fetchrow("SELECT * FROM users WHERE tg_user_id=?", (tg_user_id,))
-
-    async def list_users(self):
-        return await self.fetchall("SELECT * FROM users", ())
-
-    async def upsert_memory(self, user_id: int, key: str, value: str):
-        q = """
-        INSERT INTO user_memory (user_id, key, value)
-        VALUES (?, ?, ?)
-        ON CONFLICT(user_id, key) DO UPDATE SET
-          value=excluded.value,
-          updated_at=datetime('now');
-        """
-        await self.execute(q, (user_id, key, value))
-
-    async def get_memory_map(self, user_id: int) -> dict[str, str]:
-        rows = await self.fetchall("SELECT key, value FROM user_memory WHERE user_id=?", (user_id,))
-        return {r["key"]: r["value"] for r in rows}
-
-    async def insert_plan_day(
-        self,
-        user_id: int,
-        day: str,
-        es_topic: str,
-        es_tasks_json: str,
-        it_topic: str,
-        it_tasks_json: str
-    ):
-        q = """
-        INSERT INTO daily_plans (user_id, day_date, spanish_topic, spanish_tasks, italian_topic, italian_tasks)
-        VALUES (?, ?, ?, ?, ?, ?)
-        ON CONFLICT(user_id, day_date) DO NOTHING;
-        """
-        await self.execute(q, (user_id, day, es_topic, es_tasks_json, it_topic, it_tasks_json))
-
-    async def get_plan_day(self, user_id: int, day: str):
-        return await self.fetchrow("SELECT * FROM daily_plans WHERE user_id=? AND day_date=?", (user_id, day))
-
-    async def mark_done(self, user_id: int, day: str, lang: str):
-        if lang not in ("es", "it"):
-            raise ValueError("lang must be 'es' or 'it'")
-        col = "spanish_done" if lang == "es" else "italian_done"
-        q = f"""
-        INSERT INTO daily_progress (user_id, day_date, {col})
-        VALUES (?, ?, 1)
-        ON CONFLICT(user_id, day_date) DO UPDATE SET
-          {col}=1, updated_at=datetime('now');
-        """
-        await self.execute(q, (user_id, day))
-
-    async def log_interaction(self, user_id: int, role: str, text: str):
+    # ---------- Languages ----------
+    async def set_user_languages(self, user_id: int, langs_with_levels: list[tuple[str, str]], order: list[str]) -> None:
+        # langs_with_levels: [(lang_code, level), ...]
+        # order: list lang_code in chosen order
+        sort_map = {code: i for i, code in enumerate(order)}
+        # remove languages that are not selected anymore
+        selected_codes = [c for c, _ in langs_with_levels]
         await self.execute(
-            "INSERT INTO interactions (user_id, role, text) VALUES (?, ?, ?)",
-            (user_id, role, text)
+            f"DELETE FROM user_languages WHERE user_id=? AND lang_code NOT IN ({','.join(['?']*len(selected_codes))})",
+            [user_id] + selected_codes,
         )
+
+        for code, level in langs_with_levels:
+            await self.execute(
+                """
+                INSERT INTO user_languages (user_id, lang_code, level, sort_order)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(user_id, lang_code) DO UPDATE SET
+                  level=excluded.level,
+                  sort_order=excluded.sort_order
+                """,
+                [user_id, code, level, sort_map.get(code, 0)],
+            )
+
+    async def get_user_languages(self, user_id: int) -> list[dict]:
+        return await self.fetchall(
+            "SELECT lang_code, level, sort_order FROM user_languages WHERE user_id=? ORDER BY sort_order",
+            [user_id],
+        )
+
+    # ---------- Plans ----------
+    async def clear_plans_from(self, user_id: int, start_date: str) -> None:
+        await self.execute("DELETE FROM plan_items WHERE user_id=? AND day_date>=?", [user_id, start_date])
+        await self.execute("DELETE FROM progress WHERE user_id=? AND day_date>=?", [user_id, start_date])
+
+    async def save_plan_items(self, user_id: int, items: list[dict]) -> None:
+        # item keys: day_date, slot, lang_code, kind, topic, tasks_json
+        for it in items:
+            await self.execute(
+                """
+                INSERT INTO plan_items (user_id, day_date, slot, lang_code, kind, topic, tasks_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(user_id, day_date, slot) DO UPDATE SET
+                  lang_code=excluded.lang_code,
+                  kind=excluded.kind,
+                  topic=excluded.topic,
+                  tasks_json=excluded.tasks_json
+                """,
+                [
+                    user_id,
+                    it["day_date"],
+                    it["slot"],
+                    it["lang_code"],
+                    it["kind"],
+                    it["topic"],
+                    it["tasks_json"],
+                ],
+            )
+
+    async def get_plan_for_day(self, user_id: int, day_date: str) -> list[dict]:
+        return await self.fetchall(
+            "SELECT * FROM plan_items WHERE user_id=? AND day_date=? ORDER BY CASE slot WHEN 'morning' THEN 1 ELSE 2 END",
+            [user_id, day_date],
+        )
+
+    async def get_plan_for_slot(self, user_id: int, day_date: str, slot: str) -> Optional[dict]:
+        return await self.fetchone(
+            "SELECT * FROM plan_items WHERE user_id=? AND day_date=? AND slot=?",
+            [user_id, day_date, slot],
+        )
+
+    # ---------- Progress ----------
+    async def mark_done(self, user_id: int, day_date: str, slot: str) -> None:
+        await self.execute(
+            """
+            INSERT INTO progress (user_id, day_date, slot, done, done_at)
+            VALUES (?, ?, ?, 1, datetime('now'))
+            ON CONFLICT(user_id, day_date, slot) DO UPDATE SET
+              done=1,
+              done_at=datetime('now')
+            """,
+            [user_id, day_date, slot],
+        )
+
+    async def get_progress(self, user_id: int, day_date: str) -> list[dict]:
+        return await self.fetchall("SELECT * FROM progress WHERE user_id=? AND day_date=?", [user_id, day_date])

@@ -1,80 +1,71 @@
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.cron import CronTrigger
-from datetime import datetime
-import pytz
+# app/scheduler.py
 import json
+import logging
+from datetime import datetime
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import pytz
 
-from app.logger import setup_logger
-logger = setup_logger()
+from app.config import settings
+from app.keyboards import LANGS
 
-def _fmt_tasks(tasks: list[dict]) -> str:
-    lines = []
-    for t in tasks:
-        title = t.get("title", "Задание")
-        minutes = t.get("minutes", 10)
-        lines.append(f"• {title} ({minutes} мин)")
-        steps = t.get("steps", [])
-        for s in steps[:3]:
-            lines.append(f"   - {s}")
-    return "\n".join(lines)
+logger = logging.getLogger("mentor_bot")
 
-async def _send_morning(bot, db, user):
+def _format_plan_message(plan: dict) -> str:
+    tasks = []
+    try:
+        tasks = json.loads(plan["tasks_json"])
+    except Exception:
+        tasks = []
+
+    title = LANGS.get(plan["lang_code"], plan["lang_code"])
+    kind = "🧠 Учим" if plan["kind"] == "learn" else "🔁 Повторение"
+    header = f"{kind} — {title}\nТема: *{plan['topic']}*\n"
+    bullets = "\n".join([f"• {t}" for t in tasks]) if tasks else "• (нет задач)"
+    return header + "\n" + bullets
+
+async def _send_slot(bot, db, user: dict, slot: str) -> None:
     tz = pytz.timezone(user["timezone"])
     today = datetime.now(tz).date().isoformat()
-    plan = await db.get_plan_day(user["id"], today)
+
+    plan = await db.get_plan_for_slot(user["id"], today, slot)
     if not plan:
+        logger.info(f"No plan for user_id={user['id']} slot={slot} date={today}")
         return
 
-    es_tasks = json.loads(plan["spanish_tasks"])
-    text = (
-        f"🇪🇸 Утро. Сегодня испанский:\n"
-        f"Тема: *{plan['spanish_topic']}*\n\n"
-        f"{_fmt_tasks(es_tasks)}\n\n"
-        f"/today  /done es"
-    )
-    await bot.send_message(user["tg_chat_id"], text, parse_mode="Markdown")
+    text = _format_plan_message(plan)
+    await bot.send_message(user["chat_id"], text, parse_mode="Markdown")
+    logger.info(f"Sent {slot} plan to user_id={user['id']}")
 
-async def _send_evening(bot, db, user):
-    tz = pytz.timezone(user["timezone"])
-    today = datetime.now(tz).date().isoformat()
-    plan = await db.get_plan_day(user["id"], today)
-    if not plan:
-        return
-
-    it_tasks = json.loads(plan["italian_tasks"])
-    text = (
-        f"🇮🇹 Вечер. Сегодня итальянский:\n"
-        f"Тема: *{plan['italian_topic']}*\n\n"
-        f"{_fmt_tasks(it_tasks)}\n\n"
-        f"/today  /done it"
-    )
-    await bot.send_message(user["tg_chat_id"], text, parse_mode="Markdown")
-
-def setup_scheduler(bot, db, users_loader, morning_hour: int, evening_hour: int):
-    scheduler = AsyncIOScheduler()
+def setup_scheduler(bot, db) -> AsyncIOScheduler:
+    scheduler = AsyncIOScheduler(timezone=settings.TZ_DEFAULT)
 
     async def morning_job():
-        users = await users_loader()
-        logger.info(f"Scheduler morning_job: users={len(users)}")
+        users = await db.get_all_users()
         for u in users:
-            try:
-                await _send_morning(bot, db, u)
-            except Exception as e:
-                logger.error(f"Morning send failed: {e}", exc_info=True)
+            await _send_slot(bot, db, u, "morning")
 
     async def evening_job():
-        users = await users_loader()
-        logger.info(f"Scheduler evening_job: users={len(users)}")
+        users = await db.get_all_users()
         for u in users:
-            try:
-                await _send_evening(bot, db, u)
-            except Exception as e:
-                logger.error(f"Evening send failed: {e}", exc_info=True)
+            await _send_slot(bot, db, u, "evening")
 
-    # триггеры по часам, фактическую дату берём по timezone пользователя в _send_...
-    scheduler.add_job(morning_job, CronTrigger(hour=morning_hour, minute=0))
-    scheduler.add_job(evening_job, CronTrigger(hour=evening_hour, minute=0))
+    scheduler.add_job(
+        morning_job,
+        "cron",
+        hour=settings.MORNING_HOUR,
+        minute=0,
+        id="morning_job",
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        evening_job,
+        "cron",
+        hour=settings.EVENING_HOUR,
+        minute=0,
+        id="evening_job",
+        replace_existing=True,
+    )
 
     scheduler.start()
-    logger.info(f"Scheduler started: morning={morning_hour}:00 evening={evening_hour}:00")
+    logger.info("Scheduler started")
     return scheduler

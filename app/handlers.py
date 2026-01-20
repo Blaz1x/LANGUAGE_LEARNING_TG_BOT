@@ -1,136 +1,188 @@
-from aiogram import Router, F
-from aiogram.types import Message, CallbackQuery
-from aiogram.fsm.context import FSMContext
+# app/handlers.py
+import json
+import logging
 from datetime import datetime
 import pytz
-import json
 
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+
+from app.config import settings
 from app.states import Onboarding
-from app.keyboards import level_kb
+from app.keyboards import languages_keyboard, levels_keyboard, LANGS
 from app.planner import generate_month_plan
-from app.logger import setup_logger
 
-logger = setup_logger()
-
+logger = logging.getLogger("mentor_bot")
 router = Router()
 
-def today_for_user(timezone: str):
-    tz = pytz.timezone(timezone)
-    return datetime.now(tz).date()
-
-@router.message(F.text == "/start")
-async def start(message: Message, state: FSMContext, db, settings):
-    logger.info(f"/start from user {message.from_user.id}")
-
+@router.message(Command("start"))
+async def start(message: Message, state: FSMContext, db):
     user = await db.upsert_user(message.from_user.id, message.chat.id, settings.TZ_DEFAULT)
 
+    await state.set_state(Onboarding.choosing_languages)
+    await state.update_data(selected_langs=[], levels={}, level_queue=[], level_index=0)
+
     await message.answer(
-        "Я твой куратор 👇\n"
-        "Сейчас быстро настроим уровни, чтобы план был точный.\n\n"
-        "🇪🇸 Какой у тебя уровень испанского?",
-        reply_markup=level_kb("lvl_es"),
+        "Выбери языки, которые учим (можно 1–4). Потом я спрошу уровень каждого языка.",
+        reply_markup=languages_keyboard([]),
     )
-    await state.set_state(Onboarding.choosing_es)
+    logger.info(f"/start user_id={user['id']} tg={message.from_user.id}")
 
-@router.callback_query(F.data.startswith("lvl_es:"))
-async def pick_es(callback: CallbackQuery, state: FSMContext, db):
-    lvl = callback.data.split(":")[1]
-    logger.info(f"Spanish level selected: {lvl}")
+@router.callback_query(F.data.startswith("lang_toggle:"))
+async def lang_toggle(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    selected = list(data.get("selected_langs", []))
 
-    await db.set_levels(callback.from_user.id, es_level=lvl)
+    code = callback.data.split(":")[1]
+    if code in selected:
+        selected.remove(code)
+    else:
+        selected.append(code)
+
+    await state.update_data(selected_langs=selected)
+    await callback.answer("Ок")
+    await callback.message.edit_reply_markup(reply_markup=languages_keyboard(selected))
+
+@router.callback_query(F.data == "lang_reset")
+async def lang_reset(callback: CallbackQuery, state: FSMContext):
+    await state.update_data(selected_langs=[], levels={}, level_queue=[], level_index=0)
+    await callback.answer("Сброшено")
+    await callback.message.edit_reply_markup(reply_markup=languages_keyboard([]))
+
+@router.callback_query(F.data == "lang_done")
+async def lang_done(callback: CallbackQuery, state: FSMContext, db):
+    data = await state.get_data()
+    selected = list(data.get("selected_langs", []))
+
+    if not selected:
+        await callback.answer("Выбери хотя бы один язык")
+        return
+
+    # Keep chosen order as priority (click order)
+    await state.update_data(level_queue=selected, level_index=0, levels={})
+    await state.set_state(Onboarding.choosing_levels)
+
+    first = selected[0]
+    await callback.answer("Принял ✅")
+    await callback.message.edit_text(
+        f"Ок. Теперь выбери уровень для языка: *{LANGS[first]}*",
+        parse_mode="Markdown",
+        reply_markup=levels_keyboard(first),
+    )
+
+@router.callback_query(Onboarding.choosing_levels, F.data.startswith("lvl:"))
+async def pick_level(callback: CallbackQuery, state: FSMContext, db):
+    # Important: answer callback immediately to avoid Telegram timeout
+    await callback.answer("Принял ✅")
+
+    _, lang_code, level = callback.data.split(":")
+    data = await state.get_data()
+
+    levels = dict(data.get("levels", {}))
+    queue = list(data.get("level_queue", []))
+    idx = int(data.get("level_index", 0))
+
+    levels[lang_code] = level
+
+    # move forward
+    idx += 1
+    await state.update_data(levels=levels, level_index=idx)
+
+    # If still have languages to ask
+    if idx < len(queue):
+        next_lang = queue[idx]
+        await callback.message.edit_text(
+            f"Уровень для языка: *{LANGS[next_lang]}*",
+            parse_mode="Markdown",
+            reply_markup=levels_keyboard(next_lang),
+        )
+        return
+
+    # Done: save languages+levels, generate plan
+    user = await db.get_user_by_tg(callback.from_user.id)
+    if not user:
+        user = await db.upsert_user(callback.from_user.id, callback.message.chat.id, settings.TZ_DEFAULT)
+
+    order = queue  # chosen order
+    langs_with_levels = [(code, levels[code]) for code in order]
+    await db.set_user_languages(user["id"], langs_with_levels, order)
+
+    tz = pytz.timezone(user["timezone"])
+    start_day = datetime.now(tz).date()
 
     await callback.message.edit_text(
-        f"🇪🇸 Испанский: *{lvl}* ✅\n\n🇮🇹 Теперь уровень итальянского?",
-        parse_mode="Markdown",
-        reply_markup=level_kb("lvl_it"),
-    )
-    await state.set_state(Onboarding.choosing_it)
-    await callback.answer("Принял ✅ Делаю план…")
-
-
-@router.callback_query(F.data.startswith("lvl_it:"))
-async def pick_it(callback: CallbackQuery, state: FSMContext, db):
-    lvl = callback.data.split(":")[1]
-    logger.info(f"Italian level selected: {lvl}")
-
-    # ✅ ВАЖНО: ответить на callback сразу, чтобы не протух
-    await callback.answer("Принял ✅ Генерирую план…")
-
-    user = await db.set_levels(callback.from_user.id, it_level=lvl)
-
-    await callback.message.edit_text(
-        f"🇮🇹 Итальянский: *{lvl}* ✅\n\n"
-        "Генерирую твой план на 30 дней и включаю напоминания…",
+        "Отлично ✅ Уровни сохранил.\n\nГенерирую твой план на 30 дней… (может занять 1–3 минуты)",
         parse_mode="Markdown",
     )
 
-    # Память
-    await db.upsert_memory(user["id"], "format", "Утром испанский (актив), вечером итальянский (легкий)")
-    await db.upsert_memory(user["id"], "rule", "Не смешивать языки в одной сессии")
-
-    tz = user["timezone"]
-    start_day = datetime.now(pytz.timezone(tz)).date()
-
-    logger.info(f"Generating 30-day plan for user_id={user['id']}")
+    logger.info(f"Generating plan for user_id={user['id']} langs={order} levels={levels}")
     try:
         await generate_month_plan(db, user, start_day)
     except Exception as e:
         logger.error(f"Plan generation failed: {e}", exc_info=True)
         await callback.message.answer(
-            "❌ Не смог достучаться до OpenAI (таймаут/сеть через прокси).\n"
-            "Попробуй ещё раз через минуту или временно отключи прокси.\n"
-            "Если хочешь — добавлю команду /regenerate."
+            "❌ Не смог достучаться до OpenAI (таймаут/сеть).\n"
+            "Попробуй ещё раз позже. Если хочешь — добавлю команду /regenerate."
         )
         await state.clear()
         return
 
     await callback.message.answer(
-        "Готово ✅\n"
-        "Теперь каждое утро будет 🇪🇸 испанский, каждый вечер — 🇮🇹 итальянский.\n\n"
+        "Готово ✅\n\n"
         "Команды:\n"
         "/today — план на сегодня\n"
-        "/done es — отметил испанский\n"
-        "/done it — отметил итальянский"
+        "/done morning — отметить утро\n"
+        "/done evening — отметить вечер\n"
     )
     await state.clear()
 
-
-@router.message(F.text == "/today")
+@router.message(Command("today"))
 async def today(message: Message, db):
     user = await db.get_user_by_tg(message.from_user.id)
     if not user:
-        return await message.answer("Нажми /start")
+        await message.answer("Сначала /start")
+        return
 
-    day = today_for_user(user["timezone"]).isoformat()
-    plan = await db.get_plan_day(user["id"], day)
-    if not plan:
-        return await message.answer("На сегодня плана нет. Нажми /start — пересоздам план.")
+    tz = pytz.timezone(user["timezone"])
+    day = datetime.now(tz).date().isoformat()
 
-    es_tasks = json.loads(plan["spanish_tasks"])
-    it_tasks = json.loads(plan["italian_tasks"])
+    plans = await db.get_plan_for_day(user["id"], day)
+    if not plans:
+        await message.answer("На сегодня план не найден. Нажми /start чтобы сгенерировать.")
+        return
 
-    def fmt(tasks):
-        return "\n".join([f"• {t.get('title','Задание')} ({t.get('minutes',10)} мин)" for t in tasks])
+    blocks = []
+    for p in plans:
+        tasks = []
+        try:
+            tasks = json.loads(p["tasks_json"])
+        except Exception:
+            tasks = []
+        title = LANGS.get(p["lang_code"], p["lang_code"])
+        kind = "🧠 Учим" if p["kind"] == "learn" else "🔁 Повторение"
+        slot = "🌅 Утро" if p["slot"] == "morning" else "🌙 Вечер"
+        bullets = "\n".join([f"• {t}" for t in tasks]) if tasks else "• (нет задач)"
+        blocks.append(f"{slot} — {kind} — {title}\nТема: *{p['topic']}*\n{bullets}")
 
-    await message.answer(
-        f"📌 План на сегодня ({day}):\n\n"
-        f"🇪🇸 *{plan['spanish_topic']}*\n{fmt(es_tasks)}\n\n"
-        f"🇮🇹 *{plan['italian_topic']}*\n{fmt(it_tasks)}\n\n"
-        f"/done es  /done it",
-        parse_mode="Markdown",
-    )
+    await message.answer("\n\n".join(blocks), parse_mode="Markdown")
 
-@router.message(F.text.startswith("/done"))
+@router.message(Command("done"))
 async def done(message: Message, db):
+    parts = message.text.strip().split()
+    if len(parts) < 2 or parts[1] not in ("morning", "evening"):
+        await message.answer("Используй: /done morning или /done evening")
+        return
+
+    slot = parts[1]
     user = await db.get_user_by_tg(message.from_user.id)
     if not user:
-        return await message.answer("Нажми /start")
+        await message.answer("Сначала /start")
+        return
 
-    parts = message.text.split()
-    if len(parts) < 2:
-        return await message.answer("Формат: /done es или /done it")
+    tz = pytz.timezone(user["timezone"])
+    day = datetime.now(tz).date().isoformat()
 
-    lang = parts[1].strip().lower()
-    day = today_for_user(user["timezone"]).isoformat()
-    await db.mark_done(user["id"], day, lang)
-    await message.answer("Отметил ✅")
+    await db.mark_done(user["id"], day, slot)
+    await message.answer(f"✅ Отметил: {slot} за {day}")

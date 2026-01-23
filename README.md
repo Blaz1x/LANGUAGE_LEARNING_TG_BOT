@@ -48,7 +48,7 @@ httpx (proxy support)
 ```
 ### 📁 Структура проекта
 
-``md
+```text
 learning_bot/
 ├── app/
 │   ├── main.py
@@ -73,7 +73,8 @@ learning_bot/
 ├── .env.example
 ├── .gitignore
 └── README.md
-``
+``` 
+
 ### ⚙️ Установка (локально или на сервере)
 ## 1️⃣ Клонировать репозиторий
 ```bash

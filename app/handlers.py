@@ -14,11 +14,16 @@ from app.states import Onboarding
 from app.keyboards import languages_keyboard, levels_keyboard, LANGS
 from app.planner import generate_month_plan
 
+# NEW: debug notify helpers
+from app.scheduler import send_slot_notification
+
 logger = logging.getLogger("mentor_bot")
 router = Router()
 
+
 @router.message(Command("start"))
 async def start(message: Message, state: FSMContext, db):
+    # ВАЖНО: сохраняем chat_id, чтобы уведомления было куда слать
     user = await db.upsert_user(message.from_user.id, message.chat.id, settings.TZ_DEFAULT)
 
     await state.set_state(Onboarding.choosing_languages)
@@ -28,7 +33,74 @@ async def start(message: Message, state: FSMContext, db):
         "Выбери языки, которые учим (можно 1–4). Потом я спрошу уровень каждого языка.",
         reply_markup=languages_keyboard([]),
     )
-    logger.info(f"/start user_id={user['id']} tg={message.from_user.id}")
+    logger.info(f"/start user_id={user['id']} tg={message.from_user.id} chat={message.chat.id}")
+
+
+# =========================
+# DEBUG COMMANDS (NEW)
+# =========================
+
+@router.message(Command("ping"))
+async def ping(message: Message):
+    await message.answer("🏓 pong\n\n✅ Бот жив. Если уведомления не приходят — проверим /test_morning и /test_evening.")
+
+
+@router.message(Command("test_morning"))
+async def test_morning(message: Message, db, bot):
+    """
+    Моментально отправляет утреннее уведомление так же, как scheduler.
+    """
+    # на всякий случай обновим chat_id (если юзер сменил чат/переоткрыл)
+    await db.upsert_user(message.from_user.id, message.chat.id, settings.TZ_DEFAULT)
+
+    user = await db.get_user_by_tg(message.from_user.id)
+    if not user:
+        await message.answer("Сначала /start")
+        return
+
+    await message.answer("⏳ Тестирую утреннее уведомление…")
+    try:
+        ok = await send_slot_notification(bot, db, user, "morning")
+    except Exception as e:
+        logger.error(f"/test_morning failed: {e}", exc_info=True)
+        await message.answer(f"❌ Ошибка при отправке: {type(e).__name__}: {e}")
+        return
+
+    if ok:
+        await message.answer("✅ Отправил. Если не пришло — значит Telegram блокирует/не тот чат.")
+    else:
+        await message.answer("❌ Не отправил (скорее всего нет chat_id/tg_chat_id в БД). Напиши /start ещё раз.")
+
+
+@router.message(Command("test_evening"))
+async def test_evening(message: Message, db, bot):
+    """
+    Моментально отправляет вечернее уведомление так же, как scheduler.
+    """
+    await db.upsert_user(message.from_user.id, message.chat.id, settings.TZ_DEFAULT)
+
+    user = await db.get_user_by_tg(message.from_user.id)
+    if not user:
+        await message.answer("Сначала /start")
+        return
+
+    await message.answer("⏳ Тестирую вечернее уведомление…")
+    try:
+        ok = await send_slot_notification(bot, db, user, "evening")
+    except Exception as e:
+        logger.error(f"/test_evening failed: {e}", exc_info=True)
+        await message.answer(f"❌ Ошибка при отправке: {type(e).__name__}: {e}")
+        return
+
+    if ok:
+        await message.answer("✅ Отправил. Если не пришло — значит Telegram блокирует/не тот чат.")
+    else:
+        await message.answer("❌ Не отправил (скорее всего нет chat_id/tg_chat_id в БД). Напиши /start ещё раз.")
+
+
+# =========================
+# ONBOARDING FLOW
+# =========================
 
 @router.callback_query(F.data.startswith("lang_toggle:"))
 async def lang_toggle(callback: CallbackQuery, state: FSMContext):
@@ -45,11 +117,13 @@ async def lang_toggle(callback: CallbackQuery, state: FSMContext):
     await callback.answer("Ок")
     await callback.message.edit_reply_markup(reply_markup=languages_keyboard(selected))
 
+
 @router.callback_query(F.data == "lang_reset")
 async def lang_reset(callback: CallbackQuery, state: FSMContext):
     await state.update_data(selected_langs=[], levels={}, level_queue=[], level_index=0)
     await callback.answer("Сброшено")
     await callback.message.edit_reply_markup(reply_markup=languages_keyboard([]))
+
 
 @router.callback_query(F.data == "lang_done")
 async def lang_done(callback: CallbackQuery, state: FSMContext, db):
@@ -71,6 +145,7 @@ async def lang_done(callback: CallbackQuery, state: FSMContext, db):
         parse_mode="Markdown",
         reply_markup=levels_keyboard(first),
     )
+
 
 @router.callback_query(Onboarding.choosing_levels, F.data.startswith("lvl:"))
 async def pick_level(callback: CallbackQuery, state: FSMContext, db):
@@ -104,6 +179,10 @@ async def pick_level(callback: CallbackQuery, state: FSMContext, db):
     user = await db.get_user_by_tg(callback.from_user.id)
     if not user:
         user = await db.upsert_user(callback.from_user.id, callback.message.chat.id, settings.TZ_DEFAULT)
+    else:
+        # IMPORTANT: обновим chat_id на всякий случай (это прям помогает с уведомлениями)
+        await db.upsert_user(callback.from_user.id, callback.message.chat.id, user["timezone"])
+        user = await db.get_user_by_tg(callback.from_user.id)
 
     order = queue  # chosen order
     langs_with_levels = [(code, levels[code]) for code in order]
@@ -135,8 +214,15 @@ async def pick_level(callback: CallbackQuery, state: FSMContext, db):
         "/today — план на сегодня\n"
         "/done morning — отметить утро\n"
         "/done evening — отметить вечер\n"
+        "/test_morning — тест утреннего уведомления\n"
+        "/test_evening — тест вечернего уведомления\n"
     )
     await state.clear()
+
+
+# =========================
+# USER COMMANDS
+# =========================
 
 @router.message(Command("today"))
 async def today(message: Message, db):
@@ -167,6 +253,7 @@ async def today(message: Message, db):
         blocks.append(f"{slot} — {kind} — {title}\nТема: *{p['topic']}*\n{bullets}")
 
     await message.answer("\n\n".join(blocks), parse_mode="Markdown")
+
 
 @router.message(Command("done"))
 async def done(message: Message, db):

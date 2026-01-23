@@ -1,8 +1,8 @@
-# 📚 Mentor Language Bot
+### 📚 Mentor Language Bot
 
-Telegram-бот-куратор для параллельного изучения испанского 🇪🇸 и итальянского 🇮🇹 с помощью OpenAI.
+Telegram-бот-куратор для параллельного изучения языков с помощью OpenAI.
 
-# Бот:
+### Бот:
 
 спрашивает уровень каждого языка (A1–C2);
 
@@ -32,8 +32,8 @@ Telegram-бот-куратор для параллельного изучени�
 
 📜 Подробные логи в терминале
 
-# 🛠 Технологии
-
+### 🛠 Технологии
+```bash
 Python 3.11+ (рекомендуется)
 
 aiogram 3
@@ -45,8 +45,10 @@ SQLite + aiosqlite
 APScheduler
 
 httpx (proxy support)
+```
+### 📁 Структура проекта
 
-# 📁 Структура проекта
+``md
 learning_bot/
 ├── app/
 │   ├── main.py
@@ -71,16 +73,21 @@ learning_bot/
 ├── .env.example
 ├── .gitignore
 └── README.md
-
-# ⚙️ Установка (локально или на сервере)
-1️⃣ Клонировать репозиторий
+``
+### ⚙️ Установка (локально или на сервере)
+## 1️⃣ Клонировать репозиторий
+```bash
 git clone <REPO_URL>
 cd learning_bot
-
-2️⃣ Создать виртуальное окружение
+```
+## 2️⃣ Создать виртуальное окружение
+```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -U pip
+```
 
-3️⃣ Установить зависимости
+## 3️⃣ Установить зависимости
+```bash
 pip install -r requirements.txt
+```
